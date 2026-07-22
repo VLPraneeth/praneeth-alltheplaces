@@ -1,0 +1,94 @@
+import re
+
+from scrapy.spiders import SitemapSpider
+
+from locations.categories import Categories, apply_category
+from locations.hours import DAYS_FR, OpeningHours
+from locations.items import Feature
+
+
+class SystemeUSpider(SitemapSpider):
+    name = "systeme_u"
+    item_attributes = {"brand": "Système U", "brand_wikidata": "Q2529029"}
+    allowed_domains = ["magasins-u.com"]
+    sitemap_urls = ["https://www.magasins-u.com/sitemap.xml"]
+    sitemap_rules = [(r"com\/(magasin|station)\/", "parse_stores")]
+    requires_proxy = "FR"  # Proxy or other captcha drama?
+    brands = {
+        "uexpress": {"brand": "U Express", "brand_wikidata": "Q2529029"},
+        "superu": {"brand": "Super U", "brand_wikidata": "Q2529029"},
+        "marcheu": {"brand": "Marché U", "brand_wikidata": "Q2529029"},
+        "hyperu": {"brand": "Hyper U", "brand_wikidata": "Q2529029"},
+    }
+
+    def parse_hours(self, hours):
+        opening_hours = OpeningHours()
+
+        for hour in hours:
+
+            # Check if the hour data indicates 24/7 availability
+            hour_text = hour.get()
+            if hour_text:
+                hour_text = hour_text.strip()
+
+            if "24h/24 - 7j/7" in hour_text:
+                for day in DAYS_FR.values():
+                    opening_hours.add_range(
+                        day=day,
+                        open_time="00:00",
+                        close_time="24:00",
+                        time_format="%H:%M",
+                    )
+                continue
+
+            day = hour.xpath('.//td[@class="day"]/text()').extract_first()
+            schedule = hour.xpath('.//td[@class="schedule"]/text()').extract_first()
+
+            if schedule and schedule.lower() != "fermé":
+                open_time, close_time = schedule.split(" - ")
+                opening_hours.add_range(
+                    day=DAYS_FR[day],
+                    open_time=open_time,
+                    close_time=close_time,
+                    time_format="%H:%M",
+                )
+
+        return opening_hours
+
+    def parse_stores(self, response):
+        properties = {
+            "ref": response.url,
+            "name": response.xpath('//div[@class="info-magasin-station"]/h1[@class="h1"]/text()').extract_first(),
+            "street_address": response.xpath(
+                'normalize-space(//div[@class="address b-md b-md--sm"]/p[1]/text())'
+            ).extract_first(),
+            "city": response.xpath(
+                'normalize-space(//div[@class="address b-md b-md--sm"]/p[2]/span[2]/text())'
+            ).extract_first(),
+            "postcode": response.xpath(
+                'normalize-space(//div[@class="address b-md b-md--sm"]/p[2]/span[1]/text())'
+            ).extract_first(),
+            "country": "FR",
+            "lat": response.xpath("//@data-store-latitude").extract_first(),
+            "lon": response.xpath("//@data-store-longitude").extract_first(),
+            "phone": response.xpath('//div[@class="phone-number b-md"]/text()').extract_first(),
+            "website": response.url,
+        }
+
+        if m := re.search(r"/(magasin|station)/(uexpress|superu|marcheu|marcheru|hyperu)-\w+", response.url):
+            if m.group(1) == "magasin":
+                apply_category(Categories.SHOP_SUPERMARKET, properties)
+                hours_xpath = '//div[@id="magasin-tab"]//div[@class="u-horaire"]//tr[@class="u-horaire__line-day"]'
+            else:
+                apply_category(Categories.FUEL_STATION, properties)
+                hours_xpath = '//div[@class="u-station__magasin"]/p[2]/text()'
+            category_name = m.group(2)
+            if category_name == "marcheru":
+                category_name = "marcheu"
+            properties.update(self.brands[category_name])
+
+        try:
+            properties["opening_hours"] = self.parse_hours(response.xpath(hours_xpath))
+        except:
+            pass
+        yield Feature(**properties)

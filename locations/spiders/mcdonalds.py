@@ -1,0 +1,171 @@
+from typing import AsyncIterator, Iterable
+
+from scrapy import Spider
+from scrapy.http import Request, Response
+
+from locations.categories import Categories, Extras, apply_category, apply_yes_no
+from locations.dict_parser import DictParser
+from locations.geo import city_locations, country_iseadgg_centroids
+from locations.hours import DAYS_FULL, OpeningHours
+from locations.items import Feature
+from locations.pipelines.address_clean_up import clean_address
+
+
+class McdonaldsSpider(Spider):
+    name = "mcdonalds"
+    item_attributes = {
+        "brand": "McDonald's",
+        "brand_wikidata": "Q38076",
+        "extras": Categories.FAST_FOOD.value,
+    }
+    allowed_domains = ["www.mcdonalds.com"]
+
+    ISEADGG_COUNTRIES = {"AU", "CA", "NZ", "US"}
+
+    async def start(self) -> AsyncIterator[Request]:
+        template = "https://www.mcdonalds.com/googleappsv2/geolocation?latitude={}&longitude={}&radius=50&maxResults=250&country={}&language={}&showClosed="
+        for locale in [
+            "en-au",
+            "en-ca",
+            "en-gb",
+            "en-nz",
+            "fi-fi",
+            "en-ie",
+            "en-us",
+            "de-de",
+            "nb-no",
+            "en-ae",
+            "dk-dk",
+            "nl-nl",
+            "en-om",
+            "en-qa",
+            "en-kw",
+            "en-bh",
+            "fr-ch",
+            "sv-se",
+            "en-sa",
+            "uk-ua",
+            "hu-hu",
+            "zh-tw",
+            "hr-hr",
+        ]:
+            country = locale.split("-")[1]
+            if country.upper() in self.ISEADGG_COUNTRIES:
+                for lat, lon in country_iseadgg_centroids(country.upper(), 48):
+                    url = template.format(lat, lon, country, locale)
+                    yield Request(
+                        url,
+                        self.parse_major_api,
+                        cb_kwargs=dict(country=country, locale=locale),
+                    )
+            else:
+                for city in city_locations(country.upper(), 20000):
+                    if country == "sa":
+                        url = template.format(city["latitude"], city["longitude"], "sar", "en")
+                    else:
+                        url = template.format(city["latitude"], city["longitude"], country, locale)
+                    yield Request(
+                        url,
+                        self.parse_major_api,
+                        cb_kwargs=dict(country=country, locale=locale),
+                    )
+
+    def parse_major_api(self, response: Response, country: str, locale: str) -> Iterable[Feature]:
+        if len(response.body) == 0:
+            return
+        stores = response.json()["features"]
+        for store in stores:
+            properties = store["properties"]
+            store_identifier = properties["identifierValue"]
+            store_url = None
+            if locale in [
+                "en-ca",
+                "en-gb",
+                "en-ie",
+                "en-nz",
+                "en-us",
+                "fi-fi",
+                "fr-ch",
+                "hu-hu",
+                "sv-se",
+                "zh-tw",
+                "hr-hr",
+            ]:
+                # Individual store site pages in these locale's have a common pattern.
+                store_url = "https://www.mcdonalds.com/{}/{}/location/{}.html".format(country, locale, store_identifier)
+            elif locale in ["de-de"]:
+                store_url = properties.get("restaurantUrl")
+                if not store_url.startswith("https://www.mcdonalds.com/"):
+                    # Most of the sites have good individual site pages, some do not.
+                    store_url = None
+            elif locale in [
+                "nb-no",
+                "en-ae",
+                "en-om",
+                "en-qa",
+                "en-kw",
+                "en-bh",
+                "en-sa",
+            ]:
+                # These locale's do not support individual site pages.
+                pass
+            elif locale in ["da-dk", "nl-nl"]:
+                store_url = properties.get("restaurantUrl")
+            if not store_url:
+                store_url = "https://www.mcdonalds.com/"
+
+            item = DictParser.parse(properties)
+            item["branch"] = (
+                (item.pop("name") or "")
+                .removeprefix("MCDONALD'S RESTAURANT -")
+                .removeprefix("McDonald's")
+                .removeprefix("Mcdonalds")
+                .strip()
+            )
+            item["ref"] = store_identifier
+            item["website"] = store_url
+            item["street_address"] = clean_address([properties.get("addressLine1"), properties.get("addressLine2")])
+            item["city"] = properties.get("addressLine3")
+            item["state"] = properties.get("subDivision")
+            item["country"] = country.upper()
+            item["lon"], item["lat"] = store["geometry"]["coordinates"]
+
+            # hu-hu has non-standard filterType values
+            filter_type = [p.replace("restaurant.facility.", "").upper() for p in properties["filterType"]]
+
+            apply_yes_no(Extras.DRIVE_THROUGH, item, "DRIVETHRU" in filter_type)
+            apply_yes_no(Extras.WIFI, item, "WIFI" in filter_type)
+            apply_yes_no(Extras.DELIVERY, item, "MCDELIVERYSERVICE" in filter_type)
+
+            if "MCCAFE" in filter_type:
+                mccafe = item.deepcopy()
+                mccafe["ref"] = "{}-mccafe".format(item["ref"])
+                mccafe["brand"] = "McCafé"
+                mccafe["brand_wikidata"] = "Q3114287"
+                apply_category(Categories.CAFE, mccafe)
+                yield mccafe
+
+            if hours := self.store_hours(properties.get("restauranthours")):
+                item["opening_hours"] = hours
+
+            apply_category(Categories.FAST_FOOD, item)
+
+            yield item
+
+    def store_hours(self, store_hours: dict) -> OpeningHours | None:
+        if not store_hours:
+            return None
+
+        oh = OpeningHours()
+        for day in DAYS_FULL:
+            if hours := store_hours.get("hours" + day):
+                try:
+                    start_time, end_time = hours.split(" - ")
+                    if start_time.count(":") == 2:
+                        time_format = "%H:%M:%S"
+                    else:
+                        time_format = "%H:%M"
+                    oh.add_range(day, start_time.replace("24:00", "00:00"), end_time, time_format)
+                except:
+                    self.logger.debug(f"Couldn't process opening hours: {hours}")
+        return oh

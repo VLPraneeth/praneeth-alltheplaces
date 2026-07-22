@@ -1,0 +1,60 @@
+from json import loads
+from typing import AsyncIterator
+
+from scrapy import Request, Spider
+
+from locations.categories import Categories, apply_category
+from locations.items import Feature
+
+
+class HyattSpider(Spider):
+    name = "hyatt"
+    item_attributes = {"brand": "Hyatt", "brand_wikidata": "Q1425063"}
+    allowed_domains = ["hyatt.com"]
+    requires_proxy = True
+
+    base_url = "https://www.hyatt.com/explore-hotels/partial?regionGroup={region}&categories=&brands="
+
+    regions = (
+        "1-NorthAmerica",
+        "2-CaribbeanAndLatinAmerica",
+        "3-Europe",
+        "4-AfricaAndMiddleEast",
+        "5-Asia",
+        "6-Australia",
+    )
+
+    async def start(self) -> AsyncIterator[Request]:
+        for region in self.regions:
+            yield Request(url=self.base_url.format(region=region))
+
+    def parse_hotel(self, response):
+        data = loads(response.xpath('//script[contains(text(), "streetAddress")]/text()').extract_first())
+
+        properties = {
+            "ref": "_".join(response.url.split("/")[-3:]),
+            "name": data["name"],
+            "addr_full": data["address"]["streetAddress"],
+            "city": data["address"]["addressLocality"],
+            "state": data["address"]["addressRegion"],
+            "postcode": data["address"]["postalCode"],
+            "country": data["address"]["addressCountry"],
+            "phone": data.get("telephone", None),
+            "lat": float(data["geo"]["latitude"]),
+            "lon": float(data["geo"]["longitude"]),
+            "website": response.url,
+        }
+
+        item = Feature(**properties)
+        apply_category(Categories.HOTEL, item)
+        yield item
+
+    def parse(self, response):
+        urls = response.xpath('//li[contains(@class, "property")]/a/@href').extract()
+
+        for url in urls:
+            yield Request(
+                response.urljoin(url),
+                headers={"Referer": None},
+                callback=self.parse_hotel,
+            )
