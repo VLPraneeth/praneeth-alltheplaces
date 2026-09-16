@@ -13,7 +13,6 @@ class DinosolESSpider(Spider):
     name = "dinosol_es"
     allowed_domains = ["www.hiperdino.es"]
     start_urls = ["https://www.hiperdino.es/c9504/tiendas/"]
-    requires_proxy = True
     brands = [
         (
             "HIPERDINO EXPRESS",
